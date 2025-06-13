@@ -1,0 +1,112 @@
+import json
+import re
+from experta import *
+from Sastrawi.Stemmer.StemmerFactory import StemmerFactory
+
+class SimpleSketchDetector(KnowledgeEngine):
+    def __init__(self):
+        super().__init__()
+        factory = StemmerFactory()
+        self.stemmer = factory.create_stemmer()
+
+    # Tokenisasi dan stemming kalimat
+    @Rule(Fact(kalimat=MATCH.kalimat), salience=5)
+    def preproses_kalimat(self, kalimat):
+        kalimat = kalimat.lower().strip()
+        kalimat = re.sub(r'[.,\'"\/\\\)\\(;:]','', kalimat)
+        kalimat = re.sub(r'\s+', ' ', kalimat)
+        daftar_kata = kalimat.split()
+
+        for kata in daftar_kata:
+            self.declare(Fact(kata=kata))
+
+        kalimat_stem = self.stemmer.stem(kalimat)
+        daftar_stem = kalimat_stem.split()
+        for kata in daftar_stem:
+            self.declare(Fact(kata_stem=kata))
+
+    # Ekstraksi nama tabel dan kolom dari database
+    @Rule(Fact(database=MATCH.database), salience=4)
+    def baca_database(self, database):
+        for tabel in database['entitas']:
+            self.declare(Fact(tabel=tabel))
+            for kolom in database['entitas'][tabel]:
+                self.declare(Fact(kolom=kolom))
+
+    # Identifikasi SELECT
+    @Rule(Fact(kata_stem=MATCH.kata), TEST(lambda kata: kata in ['tampil', 'lihat', 'ambil', 'cari']))
+    def identifikasi_select(self):
+        self.declare(Fact(apakah_select=True))
+
+    # Identifikasi semua kolom (*)
+    @Rule(Fact(kata_stem=MATCH.kata), TEST(lambda kata: kata in ['semua', 'seluruh', 'lengkap', 'data']))
+    def identifikasi_semua_kolom(self):
+        self.declare(Fact(apakah_semua_kolom=True))
+
+    # Identifikasi kondisi WHERE
+    @Rule(Fact(kata_stem=MATCH.kata), TEST(lambda kata: kata in ['dimana', 'dengan', 'lebih', 'kurang', '=', 'diatas']))
+    def identifikasi_condition(self):
+        self.declare(Fact(apakah_condition=True))
+
+    # Identifikasi agregasi
+    @Rule(Fact(kata_stem=MATCH.kata), TEST(lambda kata: kata in ['jumlah', 'rata', 'total', 'maksimum', 'minimum']))
+    def identifikasi_agg(self):
+        self.declare(Fact(apakah_agg=True))
+
+    # Identifikasi GROUP BY
+    @Rule(Fact(kata_stem=MATCH.kata), TEST(lambda kata: kata in ['per', 'masingmasing', 'tiap', 'group']))
+    def identifikasi_group(self):
+        self.declare(Fact(apakah_group_by=True))
+
+    # Identifikasi sketsa query
+    @Rule(
+        AND(
+            Fact(apakah_select=True),
+            Fact(apakah_agg=True),
+            Fact(apakah_group_by=True),
+            Fact(apakah_condition=True)
+        ),
+        salience=1
+    )
+    def sketsa_1(self):
+        self.declare(Fact(jenis_sketsa="SELECT $AGG $COLUMN FROM $TABLE GROUP BY $COLUMN HAVING $CONDITION"))
+
+    @Rule(
+        AND(Fact(apakah_select=True), Fact(apakah_agg=True)),
+        salience=1
+    )
+    def sketsa_2(self):
+        self.declare(Fact(jenis_sketsa="SELECT $AGG $COLUMN FROM $TABLE"))
+
+    @Rule(
+        AND(Fact(apakah_select=True), Fact(apakah_condition=True)),
+        salience=1
+    )
+    def sketsa_3(self):
+        self.declare(Fact(jenis_sketsa="SELECT $COLUMN FROM $TABLE WHERE $CONDITION"))
+
+    @Rule(Fact(apakah_select=True), salience=1)
+    def sketsa_4(self):
+        self.declare(Fact(jenis_sketsa="SELECT $COLUMN FROM $TABLE"))
+
+    @Rule(AND(Fact(apakah_select=True), Fact(apakah_semua_kolom=True), Fact(apakah_condition=True)), salience=1)
+    def sketsa_5(self):
+        self.declare(Fact(jenis_sketsa="SELECT * FROM $TABLE WHERE $CONDITION"))
+
+    @Rule(AND(Fact(apakah_select=True), Fact(apakah_semua_kolom=True)), salience=1)
+    def sketsa_6(self):
+        self.declare(Fact(jenis_sketsa="SELECT * FROM $TABLE"))
+
+    # Fungsi utama
+    def detect(self, kalimat, filepath_database_json):
+        with open(filepath_database_json, 'r') as file:
+            database = json.load(file)
+
+        self.reset()
+        self.declare(Fact(kalimat=kalimat), Fact(database=database))
+        self.run()
+
+        for fact in self.facts.values():
+            if 'jenis_sketsa' in fact:
+                return fact['jenis_sketsa']
+        return 'NOSKETCH'
